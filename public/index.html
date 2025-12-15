@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Robonarim Realtime Voice Test</title>
+    <style>
+      body {
+        font-family: system-ui, Arial;
+        max-width: 900px;
+        margin: 24px auto;
+        padding: 0 12px;
+      }
+      button {
+        padding: 10px 14px;
+        margin-right: 8px;
+        cursor: pointer;
+      }
+      textarea {
+        width: 100%;
+        min-height: 90px;
+      }
+      pre {
+        background: #0b0b0b;
+        color: #ddd;
+        padding: 12px;
+        border-radius: 10px;
+        overflow: auto;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #eee;
+        display: inline-block;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Robonarim – Realtime Voice (WebRTC) Test</h2>
+
+    <div class="row">
+      <button id="btnStart">Start</button>
+      <button id="btnStop" disabled>Stop</button>
+      <span class="pill" id="status">idle</span>
+    </div>
+
+    <h3>Optional: custom instructions</h3>
+    <textarea id="instructions"></textarea>
+
+    <h3>Send text to the agent (optional)</h3>
+    <div class="row">
+      <input
+        id="textInput"
+        style="flex: 1; padding: 10px"
+        placeholder="Type a message then send..."
+      />
+      <button id="btnSendText" disabled>Send</button>
+    </div>
+
+    <h3>Logs</h3>
+    <pre id="log"></pre>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const logEl = $("log");
+      const statusEl = $("status");
+      const btnStart = $("btnStart");
+      const btnStop = $("btnStop");
+      const btnSendText = $("btnSendText");
+      const textInput = $("textInput");
+      const instructionsEl = $("instructions");
+
+      function log(...args) {
+        const line = args
+          .map((a) => (typeof a === "string" ? a : JSON.stringify(a, null, 2)))
+          .join(" ");
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      function setStatus(s) {
+        statusEl.textContent = s;
+      }
+
+      let pc, dc, localStream, remoteAudio;
+
+      async function createEphemeralKey() {
+        const instructions = instructionsEl.value?.trim();
+        const res = await fetch("/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instructions }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        // server يرجع client_secret كـ string عادة
+        return data.client_secret;
+      }
+
+      async function start() {
+        setStatus("starting...");
+        btnStart.disabled = true;
+
+        const ephemeralKey = await createEphemeralKey();
+        log("Ephemeral key received.");
+
+        // 1) get mic
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        log("Microphone connected.");
+
+        // 2) setup peer connection
+        pc = new RTCPeerConnection();
+
+        // remote audio element
+        remoteAudio = document.createElement("audio");
+        remoteAudio.autoplay = true;
+        document.body.appendChild(remoteAudio);
+
+        pc.ontrack = (event) => {
+          remoteAudio.srcObject = event.streams[0];
+          log("🔊 Remote audio track received.");
+        };
+
+        // add local mic track
+        for (const track of localStream.getTracks()) {
+          pc.addTrack(track, localStream);
+        }
+
+        // data channel for events
+        dc = pc.createDataChannel("oai-events");
+        dc.onopen = () => {
+          log("✅ DataChannel open.");
+          btnSendText.disabled = false;
+
+          // Optional: you can send a session.update (GA supports client events)
+          // Example in docs for WebSocket uses session.update :contentReference[oaicite:4]{index=4}
+          // With WebRTC, events go over data channel similarly.
+          const evt = {
+            type: "session.update",
+            session: {
+              type: "realtime",
+              // هنا تقدر تضيف أي steering إضافي
+            },
+          };
+          dc.send(JSON.stringify(evt));
+        };
+        dc.onmessage = (m) => {
+          try {
+            const evt = JSON.parse(m.data);
+            // Show key events in logs
+            if (evt.type) log("event:", evt.type, evt);
+          } catch {
+            log("message:", m.data);
+          }
+        };
+
+        // 3) create SDP offer
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // 4) exchange SDP with OpenAI Realtime calls endpoint
+        // Docs: POST /v1/realtime/calls (Content-Type: application/sdp) :contentReference[oaicite:5]{index=5}
+        const sdpRes = await fetch("https://api.openai.com/v1/realtime/calls", {
+          method: "POST",
+          body: offer.sdp,
+          headers: {
+            Authorization: `Bearer ${ephemeralKey}`,
+            "Content-Type": "application/sdp",
+          },
+        });
+
+        if (!sdpRes.ok) {
+          const t = await sdpRes.text();
+          throw new Error("SDP exchange failed: " + t);
+        }
+
+        const answerSdp = await sdpRes.text();
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+        setStatus("connected");
+        btnStop.disabled = false;
+        log("🎧 Connected. Talk normally.");
+      }
+
+      async function stop() {
+        setStatus("stopping...");
+        btnStop.disabled = true;
+        btnSendText.disabled = true;
+
+        try {
+          dc?.close();
+        } catch {}
+        try {
+          pc?.close();
+        } catch {}
+
+        if (localStream) {
+          for (const t of localStream.getTracks()) t.stop();
+        }
+        localStream = null;
+        pc = null;
+        dc = null;
+
+        try {
+          if (remoteAudio) {
+            remoteAudio.pause();
+            remoteAudio.srcObject = null;
+            remoteAudio.remove();
+          }
+        } catch {}
+
+        setStatus("idle");
+        btnStart.disabled = false;
+        log("🛑 Stopped.");
+      }
+
+      function sendText() {
+        const text = textInput.value.trim();
+        if (!text || !dc || dc.readyState !== "open") return;
+
+        // Minimal pattern: add user message then request response
+        // Event shapes evolve; you can adjust later based on your logs.
+        dc.send(
+          JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text }],
+            },
+          })
+        );
+
+        dc.send(JSON.stringify({ type: "response.create" }));
+        textInput.value = "";
+      }
+
+      btnStart.onclick = () =>
+        start().catch((e) => {
+          log("❌ Error:", String(e?.message || e));
+          setStatus("error");
+          btnStart.disabled = false;
+        });
+
+      btnStop.onclick = () => stop();
+      $("btnSendText").onclick = () => sendText();
+      textInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") sendText();
+      });
+
+      // default instructions template (editable)
+      instructionsEl.value = `Sen Robonarim teknik servisinin deneyimli çağrı merkezi temsilcisisin.
+Amaç: müşteriyi ikna ederek cihazı kargo ile göndermesini sağlamak.
+- Net ve güven verici konuş.
+- Müşteriden model, arıza, şehir/ilçe, gönderim tercihi (kargo/kurye) bilgisini al.
+- "Onay olmadan işlem yapılmaz" ilkesini mutlaka söyle.
+- Gereksiz teknik detaylara boğma; anlaşılır ol.
+- Türkçe konuş.`;
+    </script>
+  </body>
+</html>
