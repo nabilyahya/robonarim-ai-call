@@ -1,78 +1,112 @@
 import "dotenv/config";
 import express from "express";
+import fs from "fs";
+import path from "path";
 
 const app = express();
-app.use(express.json());
+const PORT = Number(process.env.PORT || 3001);
+
+// ====== Startup logs ======
+console.log("OPENAI_API_KEY loaded?", !!process.env.OPENAI_API_KEY);
+console.log("CWD:", process.cwd());
+
+// ====== Serve UI from /public ======
 app.use(express.static("public"));
 
-const PORT = process.env.PORT || 3001;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const REALTIME_MODEL = process.env.REALTIME_MODEL || "gpt-realtime";
-const VOICE = process.env.VOICE || "marin";
-
-if (!OPENAI_API_KEY) {
-  throw new Error("Missing OPENAI_API_KEY in .env");
-}
+// ====== Parse SDP as raw text ======
+app.use(express.text({ type: ["application/sdp", "text/plain"] }));
 
 /**
- * Creates an ephemeral client secret for the browser (safe to expose to client).
- * Docs: POST /v1/realtime/client_secrets :contentReference[oaicite:2]{index=2}
+ * Load system prompt from a Markdown (.md) file.
+ * Fallback to JSON if .md doesn't exist (optional).
+ *
+ * Expected:
+ *  - prompts/aisha-intake.md   (preferred)
+ *  - prompts/aisha-intake.json (fallback)
  */
+function loadSystemPrompt(promptName = "aisha-intake") {
+  const mdPath = path.join(process.cwd(), "prompts", `${promptName}.md`);
+  const jsonPath = path.join(process.cwd(), "prompts", `${promptName}.json`);
+
+  // ✅ Preferred: Markdown
+  if (fs.existsSync(mdPath)) {
+    const md = fs.readFileSync(mdPath, "utf-8");
+    if (!md.trim()) throw new Error(`Prompt MD file is empty: ${mdPath}`);
+    return md; // return exact markdown text
+  }
+
+  // ✅ Optional fallback: JSON (old approach)
+  if (fs.existsSync(jsonPath)) {
+    const raw = fs.readFileSync(jsonPath, "utf-8");
+    const json = JSON.parse(raw);
+    if (!json?.content) {
+      throw new Error(`Prompt JSON missing "content" field: ${jsonPath}`);
+    }
+    return json.content;
+  }
+
+  // ❌ Not found
+  throw new Error(
+    `Prompt not found. Create one of these:\n- ${mdPath}\n- ${jsonPath}`
+  );
+}
+
+// ====== Create Realtime WebRTC session ======
 app.post("/session", async (req, res) => {
+  console.log("\n---- /session called ----");
+  console.log("Content-Type:", req.headers["content-type"]);
+  console.log("SDP length:", (req.body || "").length);
+
   try {
-    const { instructions } = req.body || {};
-
-    const sessionConfig = {
-      session: {
-        type: "realtime",
-        model: REALTIME_MODEL,
-        // صوت الإخراج
-        audio: { output: { voice: VOICE } },
-        // تعليمات Robonarim الأساسية (تقدر تعدلها لاحقاً)
-        instructions:
-          instructions ||
-          `
-أنت موظف Call Center محترف لشركة Robonarim (صيانة روبوتات/مكنسات).
-هدفك: الرد بصوت هادئ ومقنع، جمع معلومات واضحة (الموديل، العطل، الولاية/المدينة، طريقة الإرسال كارجو/كوريه)،
-وتشجيع العميل على إرسال الجهاز للفحص مع التأكيد: لا يتم أي إصلاح بدون موافقة.
-استخدم التركية بشكل افتراضي. لا تذكر مدينة الشركة إلا إذا سُئلت.
-          `.trim(),
-      },
-    };
-
-    const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(sessionConfig),
-    });
-
-    if (!r.ok) {
-      const t = await r.text();
-      return res
-        .status(500)
-        .json({ error: "client_secrets_failed", details: t });
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("Missing OPENAI_API_KEY in .env");
     }
 
-    const data = await r.json();
+    // Load prompt exactly as-is (MD preferred)
+    const systemPrompt = loadSystemPrompt("aisha-intake");
+    console.log("Prompt length:", systemPrompt.length);
 
-    // في الوثائق المثال يطبع data.value كـ ephemeral key :contentReference[oaicite:3]{index=3}
-    // حسب شكل الاستجابة عندك، لو كانت { value: "ek_..." } هذا كافي.
-    return res.json({
-      client_secret: data?.value || data?.client_secret || data,
-      model: REALTIME_MODEL,
-      voice: VOICE,
+    // Allow model/voice from query if you want:
+    const model = (req.query.model || "gpt-realtime").toString();
+    const voice = (req.query.voice || "marin").toString();
+    console.log("Using:", { model, voice });
+
+    const sessionConfig = {
+      type: "realtime",
+      model,
+      audio: { output: { voice } },
+      instructions: systemPrompt,
+    };
+
+    const fd = new FormData();
+    fd.set("sdp", req.body);
+    fd.set("session", JSON.stringify(sessionConfig));
+
+    console.log("Calling OpenAI: POST /v1/realtime/calls ...");
+
+    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: fd,
     });
-  } catch (e) {
-    console.error(e);
-    res
-      .status(500)
-      .json({ error: "session_error", details: String(e?.message || e) });
+
+    const text = await response.text();
+    console.log("OpenAI status:", response.status);
+    console.log("OpenAI response (first 800 chars):", text.slice(0, 800));
+
+    if (!response.ok) {
+      return res.status(500).send(`OpenAI error ${response.status}: ${text}`);
+    }
+
+    res.type("application/sdp").send(text);
+  } catch (err) {
+    console.error("Server error:", err);
+    res.status(500).send(String(err?.stack || err));
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Voice test server running: http://localhost:${PORT}`);
+  console.log(`✅ Server running at http://localhost:${PORT}`);
 });
